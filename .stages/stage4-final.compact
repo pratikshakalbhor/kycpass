@@ -1,0 +1,399 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// ============================================================================
+// KYCPass — Privacy-Preserving KYC Reuse
+// ============================================================================
+// A trusted KYC provider (issuer) verifies a user once, and the user can then
+// prove a SINGLE claim — "I hold a passed KYC credential from Issuer X and it
+// has not expired" — to any new platform (verifier), without re-sharing
+// documents, name, or any other personal detail.
+//
+// ─── PUBLIC vs PRIVATE ──────────────────────────────────────────────────────
+// On-chain (PUBLIC) ledger state contains only:
+//   issuerPubKey          — public reference of the single trusted issuer
+//   registeredVerifiers   — verifierId -> H("kyc:verifier:", secret)
+//                           (a hiding commitment; the secret itself never
+//                           appears on-chain)
+//   credentialTree        — history of roots of the issuer's credential tree
+//                           (each leaf is a hiding commitment, unreadable)
+//   commitCount           — number of credentials ever committed
+// and, emitted at proof time, the disclosed per-verifier nullifier.
+//
+// PRIVATE witness inputs, used inside circuits and NEVER revealed:
+//   userId (userSecretKey), credential expiry, KYC status detail,
+//   Merkle path, commitment nonce, issuer secret key, verifier secret.
+// userId and expiry are deliberately NOT circuit parameters: a proof's
+// parameters land in the public transcript, so keeping them as witnesses means
+// the only thing conveyed about a credential is the Boolean "valid + not
+// expired" — not its id, not its expiry date.
+//
+// An on-chain observer can therefore see that SOMETHING was issued and that an
+// UNKNOWN user proved to a SPECIFIC registered verifier — but cannot tell
+// which credential a proof concerns, cannot read expiry or documents, and
+// cannot link any two verifiers' proofs to the same user.
+//
+// OUT OF SCOPE for this MVP (explicit exclusions, not future holes to patch
+// now):
+//   - Revocation list: no mechanism to invalidate a committed credential
+//   - Multi-issuer support: exactly one hardcoded issuer per deployment
+//   - Partial-KYC-tier logic: binary only — passed or not committed
+//   - Duplicate-issuance prevention: one credential per user is enforced as a
+//     trusted-issuer process guarantee, not by this contract
+//   - Real regulated-KYC integration: issuer identity is demo/hardcoded
+// ============================================================================
+
+// KYC status enum — only "passed" credentials are ever committed by the issuer.
+export enum KYCStatus {
+  failed,
+  passed,
+  pending,
+}
+
+// ============================================================================
+// Why per-verifier nullifiers, and what attack this design prevents
+// ============================================================================
+// The issuer issues ONE underlying credential per user — a hiding commitment
+// leaf in `credentialTree`. At proof time each verifier is handed a nullifier
+// derived from (userId, verifierId). No two verifiers ever receive the same
+// value for the same user, so Verifier A cannot tell whether user U also
+// "proved" to Verifier B. This is cross-verifier unlinkability enforced
+// cryptographically, not by convention.
+//
+// The subtle attack this design must prevent — nullifier borrowing / verifier
+// impersonation — is: if verifierId were nothing more than a free-form circuit
+// parameter, a colluding or malicious party (say "verifier B") could simply
+// claim to BE verifier A by passing A's identifier when generating a proof.
+// The proof output would then carry A's nullifier, letting B mint / observe A's
+// unlinkable id and silently join records across both platforms.
+//
+// Compact's current execution model cannot bind a proof to "the contract that
+// initiated this transaction":
+//   - there is NO message-sender primitive (kernel.caller is undefined, as
+//     verified against compact 0.5.1);
+//   - ownPublicKey() is an unconstrained prover input, not a verified caller
+//     identity (the runtime serves the prover's value; nothing on-chain binds
+//     it), so it is unsafe to authorize anything with it;
+//   - kernel.self() is only the executing contract's OWN address — always true
+//     for the executing contract and so cannot identify a caller;
+//   - contract-to-contract calls are not supported, so a verifier contract
+//     cannot be required to "sign" its own call.
+// The strongest available binding is therefore a verifier REGISTRY:
+//   1. registerVerifier commits H("kyc:verifier:", verifierSecret) per
+//      verifierId; it is ISSUER-controlled, so no unrelated caller can freely
+//      register an identity.
+//   2. verifyCredential only accepts a REGISTERED verifierId and proves
+//      in-circuit knowledge of that verifier's committed secret
+//      (lookup(verifierId) == persistentHash(secret)).
+//   3. The secret is ALSO folded into the nullifier
+//      H("kyc:nullifier:", userId, verifierId, verifierSecret) as
+//      defense-in-depth: even if the registry check were bypassed, B could not
+//      reproduce A's nullifier without A's secret.
+// B can now only obtain A's nullifier by stealing A's secret itself — the
+// equivalent of stealing A's signing key, which is out of scope for any
+// credential scheme.
+// ============================================================================
+
+// Issuer's public reference: a persistent hash of the issuer's secret key.
+// Set once at deployment via the constructor; immutable thereafter.
+export sealed ledger issuerPubKey: Bytes<32>;
+
+// Verifier registry. Each entry binds a stable verifierId to a hiding
+// commitment of the verifier's secret. Registration entries are public by
+// design (they are re-checked on every verify call); the secret preimage stays
+// private and is proven via the in-circuit equality in verifyCredential.
+export ledger registeredVerifiers: Map<Bytes<32>, Bytes<32>>;
+
+// Credential anchor: a cryptographic commitment tree. Each leaf is the hiding
+// commitment persistentCommit([userId, passed, expiry], nonce) of ONE issued
+// credential. Only the root is stored on-chain; leaves cannot be read back, so
+// no observer can learn which credential a proof concerns.
+//
+// HistoricMerkleTree is used instead of MerkleTree so that a user's membership
+// path stays valid even if the issuer lands a new credential after the user
+// fetched their path but before the proof transaction confirms.
+export ledger credentialTree: HistoricMerkleTree<20, Bytes<32>>;
+
+// Running count of credentials committed on-chain.
+export ledger commitCount: Counter;
+
+// ---------------------------------------------------------------------------
+// Issuer secret key witness — supplied by the TypeScript driver.
+// The issuer proves they hold the secret key that hashes to issuerPubKey
+// without ever exposing it on-chain.
+// ---------------------------------------------------------------------------
+witness issuerSecretKey(): Bytes<32>;
+
+// ---------------------------------------------------------------------------
+// Constructor — runs once at deployment. Fixes the issuer's public key from a
+// secret key supplied via witness. All other ledgers start empty.
+// ---------------------------------------------------------------------------
+constructor() {
+  const sk = issuerSecretKey();
+  issuerPubKey = disclose(persistentHash<Vector<2, Bytes<32>>>(
+    [pad(32, "kyc:issuer:pk:"), sk]
+  ));
+}
+
+// ---------------------------------------------------------------------------
+// Internal circuit: compute the issuer's public key from a secret key.
+// Domain-separated so the value is only meaningful within this contract's
+// context.
+// ---------------------------------------------------------------------------
+circuit computeIssuerPK(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>(
+    [pad(32, "kyc:issuer:pk:"), sk]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// commitCredential — issued by the issuer to commit a credential on-chain.
+//
+// The circuit has NO public inputs. The user identifier (userSecretKey),
+// credential expiry (credentialExpiry), and random nonce (commitmentNonce) are
+// all private witnesses. Their values are fed into a hiding commitment leaf
+// persistentCommit([userId, passed, expiry], nonce) and inserted into the
+// tree — so nothing that identifies the user, their status, or their expiry is
+// ever written to or derivable from on-chain state.
+//
+// The circuit:
+//   1. Verifies the caller holds the issuer's secret key.
+//   2. Commits only credentials with kycStatus = passed.
+//   3. Inserts the hiding leaf into the credential tree.
+//
+// This is the ONE underlying issuance: no per-verifier record is created here.
+// Each verifier's nullifier is derived later, at proof time, from this single
+// credential. The issuer keeps an off-chain registry (user -> leaf, nonce,
+// expiry) so it can hand the user back their private credential material; the
+// user stores it in their wallet and presents it privately at proof time.
+//
+// OUT OF SCOPE: partial-KYC-tier logic — exactly one binary claim is
+// supported: kycStatus == passed.
+// OUT OF SCOPE: duplicate-issuance prevention. Because userId is private, the
+// contract cannot observe duplicates on-chain; this is a trusted-issuer
+// process guarantee (the issuer's own DB prevents issuing the same user
+// twice), explicitly not a contract property.
+// ---------------------------------------------------------------------------
+witness commitmentNonce(): Bytes<32>;
+witness userSecretKey(): Bytes<32>;
+witness credentialExpiry(): Uint<64>;
+
+export circuit commitCredential(): [] {
+  // Verify the issuer's secret key (witness) matches the sealed reference.
+  const sk = issuerSecretKey();
+  const pk = computeIssuerPK(sk);
+  assert(pk == issuerPubKey, "Caller is not the registered issuer");
+
+  // Only commit credentials with kycStatus = passed.
+  const status: KYCStatus = KYCStatus.passed;
+
+  // Private credential material — userId, expiry, and nonce never leave the
+  // circuit's witness surface.
+  const userId = userSecretKey();
+  const expiry = credentialExpiry();
+  const nonce = commitmentNonce();
+
+  // Build the hiding commitment leaf for this single issued credential.
+  const leaf = persistentCommit<Vector<3, Field>>([
+    userId as Field,
+    status as Field,
+    expiry as Field,
+  ], nonce);
+
+  // Insert into the tree. persistentCommit output is witness-suppressed, so
+  // the leaf stays unreadable on-chain and no disclosure is declared here.
+  credentialTree.insert(leaf);
+  commitCount.increment(1);
+}
+
+// ---------------------------------------------------------------------------
+// registerVerifier — ISSUER-controlled registration of a verifier identity.
+//
+// Inputs:
+//   verifierId         — the verifier's stable public identifier
+//   verifierSecretRoot — H("kyc:verifier:", verifierSecret) computed
+//                        OFF-CHAIN by the verifier and handed to the issuer as
+//                        a public value (exactly like publishing a public key).
+//                        The secret itself never routes through the issuer.
+//
+// Why issuer-controlled: it makes "verifier identity" an issuer-issued thing —
+// an unrelated caller cannot freely mint identity entries. Registration is a
+// public entry by design (it is re-checked on every verify call), so
+// disclose() on both the key and the commitment value is correct here.
+// Duplicate verifierIds are rejected so an existing entry cannot be
+// overwritten/taken over.
+// ---------------------------------------------------------------------------
+export circuit registerVerifier(
+  verifierId: Bytes<32>,
+  verifierSecretRoot: Bytes<32>,
+): [] {
+  // Only the trusted issuer may register a verifier identity.
+  const sk = issuerSecretKey();
+  const pk = computeIssuerPK(sk);
+  assert(pk == issuerPubKey, "Caller is not the registered issuer");
+
+  // Reject duplicate registration.
+  assert(
+    !registeredVerifiers.member(disclose(verifierId)),
+    "Verifier ID is already registered"
+  );
+
+  // Publish the commitment of the verifier's secret.
+  registeredVerifiers.insert(disclose(verifierId), disclose(verifierSecretRoot));
+}
+
+// ---------------------------------------------------------------------------
+// verifyCredential — proves "credential from Issuer X, status passed, not
+// expired" to a SPECIFIC registered verifier, returning that verifier's
+// per-verifier nullifier.
+//
+// Public inputs (intentional, and the ONLY things ever revealed):
+//   claimedIssuerPubKey  — the public reference of the issuer the prover holds
+//                          a credential from
+//   verifierId           — the single verifier this proof is bound to; must be
+//                          a REGISTERED verifier whose secret the prover knows
+//   revealedFreshUntil   — a PROVER-CHOSEN freshness bound for this proof,
+//                          constrained in-circuit to be <= the credential's
+//                          private expiry. See the "freshness" note below.
+// Private witnesses (never revealed):
+//   userSecretKey (userId), credentialExpiry, commitmentNonce, Merkle path,
+//   verifierSecret.
+//
+// FRESHNESS / EXPIRY — why a prover-chosen public bound, not the expiry:
+// Compact exposes no way to compare a private witness against the on-chain
+// block time, and only discloses a bound the user chooses. blockTimeLt and
+// blockTimeGt both force their argument into the public transcript, and no
+// primitive returns the current block time for a fully private comparison. So
+// the expiry TIMESTAMP ITSELF cannot be checked against block time in-circuit
+// without revealing it — that would leak the exact expiry date to the verifier
+// and every on-chain observer (a correlation signal and a violation of "only a
+// Boolean result"). Instead the prover reveals a lower bound
+//   revealedFreshUntil,  with  0 < revealedFreshUntil <= expiry,
+// which the circuit proves twice:
+//   a) blockTimeLt(revealedFreshUntil)  — on-chain time is before the bound
+//      (the sanctioned standard-library block-time check), and
+//   b) revealedFreshUntil <= expiry      — the bound does not exceed the
+//      credential's real (private) expiry, where `expiry` is the WITNESS also
+//      locked into the hiding leaf commitment.
+// This is sound: block time < revealedFreshUntil <= expiry  ⟹  the credential
+// is provably not expired. The DISCLOSED value is only the prover's chosen
+// bound, never the expiry timestamp itself — a privacy-conscious prover sets
+// revealedFreshUntil just past the current block time, so the verifier learns
+// nothing more than "this credential is currently valid": a genuine Boolean.
+//
+// The circuit proves, without revealing the user's identity:
+//   1. claimedIssuerPubKey matches the sealed on-chain issuer.
+//   2. verifierId is a REGISTERED verifier, and the prover knows that
+//      verifier's secret (registry lookup == persistentHash of the witness).
+//   3. The prover's private (userId, passed, expiry, nonce) recomputes the
+//      exact leaf whose membership path is presented — binding the Merkle
+//      proof to the prover's own credential, not someone else's.
+//   4. That leaf is genuinely in the on-chain credential tree (root check).
+//   5. The credential has not expired: block time < revealedFreshUntil <= the
+//      private witness expiry. The raw expiry timestamp is never disclosed —
+//      only the prover's chosen lower bound (which a privacy-conscious prover
+//      sets just past the current block time) is revealed, so only the Boolean
+//      "currently valid" is conveyed.
+//   6. Returns nullifier H("kyc:nullifier:", userId, verifierId, verifierSecret)
+//      — domain-separated, verifier-bound, secret-folded.
+//
+// The nullifier doubles as the boolean result: every assert is enforced inside
+// the circuit, so the value can only be produced when the proof is valid. It
+// also gives each verifier a private, unlinkable anchor (bind it to a proof,
+// detect replay at ITS OWN verifier) that no other verifier can observe.
+//
+// OUT OF SCOPE: revocation list. A committed credential remains provable until
+// its expiry timestamp passes; there is no invalidation mechanism in this MVP.
+// OUT OF SCOPE: multi-issuer support. claimedIssuerPubKey must match the single
+// sealed issuerPubKey on this deployment.
+// ---------------------------------------------------------------------------
+witness findCredentialPath(): MerkleTreePath<20, Bytes<32>>;
+witness verifierSecret(): Bytes<32>;
+
+export circuit verifyCredential(
+  claimedIssuerPubKey: Bytes<32>,
+  verifierId: Bytes<32>,
+  revealedFreshUntil: Uint<64>,
+): Bytes<32> {
+  // Ensure the claimed issuer matches the sealed on-chain issuer.
+  assert(
+    disclose(claimedIssuerPubKey) == issuerPubKey,
+    "Claimed issuer does not match the registered issuer"
+  );
+
+  // The verifier identity must be REGISTERED on-chain; otherwise anyone could
+  // mint a nullifier under an arbitrary/future/other verifier's identity.
+  assert(
+    registeredVerifiers.member(disclose(verifierId)),
+    "Verifier is not registered on-chain"
+  );
+
+  // The prover must actually hold THIS verifier's registered secret. Without
+  // this in-circuit proof-of-knowledge, a party could claim a registered
+  // verifierId it does not belong to (the nullifier-borrowing attack).
+  const vs = verifierSecret();
+  const vsCommit = persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "kyc:verifier:"),
+    vs,
+  ]);
+  assert(
+    vsCommit == registeredVerifiers.lookup(disclose(verifierId)),
+    "Prover does not hold this verifier's registered secret"
+  );
+
+  // Private credential material (never leaves the prover's machine).
+  const userSk = userSecretKey();
+  const expiry = credentialExpiry();
+  const nonce = commitmentNonce();
+  const status: KYCStatus = KYCStatus.passed;
+
+  // Recompute the leaf from private data and verify the presented Merkle path
+  // proves membership of THIS leaf — prevents submitting a path for someone
+  // else's credential.
+  const leaf = persistentCommit<Vector<3, Field>>([
+    userSk as Field,
+    status as Field,
+    expiry as Field,
+  ], nonce);
+
+  const path = findCredentialPath();
+  assert(
+    path.leaf == leaf,
+    "Merkle path is not for the prover's credential"
+  );
+
+  // Verify the path resolves to the on-chain credential tree root.
+  const root = merkleTreePathRoot<20, Bytes<32>>(path);
+  assert(
+    credentialTree.checkRoot(disclose(root)),
+    "Credential is not registered on-chain"
+  );
+
+  // Bind the proof to the current on-chain block time. Only the prover's
+  // chosen lower bound is revealed (it is a public parameter anyway); the
+  // expiry witness itself is never disclosed. The two assertions together
+  // enforce:  on-chain time < revealedFreshUntil <= real expiry.
+  assert(
+    blockTimeLt(disclose(revealedFreshUntil)),
+    "Credential has expired"
+  );
+
+  assert(
+    expiry >= revealedFreshUntil,
+    "Freshness bound exceeds the credential's expiry"
+  );
+
+  // Derive the per-verifier nullifier. Domain-separated (cannot collide with
+  // any leaf-commitment machinery), verifier-bound (two verifiers see two
+  // different values for the same user — no correlation), and secret-folded
+  // (defense-in-depth against identity borrowing).
+  const nullifier = persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "kyc:nullifier:"),
+    userSk,
+    disclose(verifierId),
+    vs,
+  ]);
+
+  return disclose(nullifier);
+}
