@@ -1,0 +1,32 @@
+{
+  "name": "kycpass",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KYCPass — Privacy-Preserving KYC Reuse on Midnight",
+  "type": "module",
+  "scripts": {
+    "setup": "npm install && npm run compile",
+    "compile": "compact compile contracts/KYCCredential.compact managed/KYCCredential",
+    "pretest": "npm run compile",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "cli": "tsx src/cli.ts",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "compose:up": "docker compose up -d",
+    "compose:down": "docker compose down"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
+    "@midnight-ntwrk/onchain-runtime-v3": "3.1.1",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
