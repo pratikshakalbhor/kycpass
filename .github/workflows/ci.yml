@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, release/21-commits]
   pull_request:
     branches: [main, master]
 
@@ -27,26 +27,21 @@ jobs:
             echo "No package.json found — scaffolding-only commit, skipping install."
           fi
 
-      - name: Lint
+      - name: Setup Compact Compiler
+        uses: midnightntwrk/setup-compact-action@v1
+        with:
+          compact-version: '0.5.1'
+
+      - name: Compile contract (generates managed/)
         run: |
-          if [ -f package.json ] && npm run lint --if-present 2>/dev/null; then
-            npm run lint
+          if [ -f package.json ]; then
+            npm run compile
           else
-            echo "No lint target — skipping."
+            echo "No package.json found — skipping contract compilation."
           fi
 
-      - name: Build
-        run: |
-          if [ -f package.json ] && grep -q '"build"' package.json; then
-            npm run build
-          else
-            echo "No build target — skipping."
-          fi
+      - name: Lint / typecheck
+        run: npm run lint --if-present
 
       - name: Test
-        run: |
-          if [ -f package.json ] && grep -q '"test"' package.json; then
-            npm test
-          else
-            echo "No test target — skipping."
-          fi
+        run: npm test --if-present

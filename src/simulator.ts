@@ -106,11 +106,11 @@ export class KycPassHarness {
 
   makeContract(overrides: Partial<Witnesses<object>> = {}): Contract<object> {
     return new Contract({
-      issuerSecretKey: (ctx) => [ctx.privateState, this.issuerSecret],
-      commitmentNonce: (ctx) => [ctx.privateState, this.session.nonce ?? fillByte(0)],
-      userSecretKey: (ctx) => [ctx.privateState, this.session.userSecret ?? fillByte(0)],
-      credentialExpiry: (ctx) => [ctx.privateState, this.session.expiry ?? 0n],
-      findCredentialPath: (ctx) => {
+      issuerSecretKey: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, this.issuerSecret],
+      commitmentNonce: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, this.session.nonce ?? fillByte(0)],
+      userSecretKey: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, this.session.userSecret ?? fillByte(0)],
+      credentialExpiry: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, this.session.expiry ?? 0n],
+      findCredentialPath: (ctx: rt.WitnessContext<Ledger, object>) => {
         const leaf = this.pathLeafOverride ?? this.sessionLeaf();
         const p = ctx.ledger.credentialTree.findPathForLeaf(leaf);
         if (!p) {
@@ -118,7 +118,7 @@ export class KycPassHarness {
         }
         return [ctx.privateState, p];
       },
-      verifierSecret: (ctx) => [ctx.privateState, this.session.verifierSecret ?? fillByte(0)],
+      verifierSecret: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, this.session.verifierSecret ?? fillByte(0)],
       ...overrides,
     } as Witnesses<object>);
   }
@@ -161,7 +161,7 @@ export class KycPassHarness {
 
   registerVerifier(id: Uint8Array, secret: Uint8Array, issuer?: Uint8Array): void {
     const c = issuer
-      ? this.makeContract({ issuerSecretKey: (ctx) => [ctx.privateState, issuer] })
+      ? this.makeContract({ issuerSecretKey: (ctx: rt.WitnessContext<Ledger, object>) => [ctx.privateState, issuer] })
       : this.makeContract();
     this.step(c, 'registerVerifier', [id, secretRoot(secret)]);
   }
