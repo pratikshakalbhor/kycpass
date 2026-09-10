@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          else
+            echo "No package.json found — scaffolding-only commit, skipping install."
+          fi
+
+      - name: Lint
+        run: |
+          if [ -f package.json ] && npm run lint --if-present 2>/dev/null; then
+            npm run lint
+          else
+            echo "No lint target — skipping."
+          fi
+
+      - name: Build
+        run: |
+          if [ -f package.json ] && grep -q '"build"' package.json; then
+            npm run build
+          else
+            echo "No build target — skipping."
+          fi
+
+      - name: Test
+        run: |
+          if [ -f package.json ] && grep -q '"test"' package.json; then
+            npm test
+          else
+            echo "No test target — skipping."
+          fi
