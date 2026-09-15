@@ -45,3 +45,29 @@ jobs:
 
       - name: Test
         run: npm test --if-present
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          else
+            echo "No frontend package.json found — skipping frontend install."
+          fi
+
+      - name: Frontend typecheck (tsc --noEmit)
+        working-directory: frontend
+        run: |
+          if [ -f package.json ]; then
+            npx tsc --noEmit -p tsconfig.json
+          else
+            echo "No frontend package.json found — skipping frontend typecheck."
+          fi
+
+      - name: Frontend build
+        run: |
+          if [ -f frontend/package.json ]; then
+            npm run frontend:build
+          else
+            echo "No frontend/package.json found — skipping frontend build."
+          fi

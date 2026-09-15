@@ -22,7 +22,7 @@ function random32(): Uint8Array {
 }
 
 async function sha256Hex(buf: Uint8Array): Promise<string> {
-  const h = await crypto.subtle.digest('SHA-256', buf);
+  const h = await crypto.subtle.digest('SHA-256', buf as unknown as ArrayBuffer);
   return [...new Uint8Array(h)].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
