@@ -26,11 +26,26 @@ async function sha256Hex(buf: Uint8Array): Promise<string> {
   return [...new Uint8Array(h)].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
+import type { ConnectedAPI } from './midnight';
+
 /** A public, stable display handle for a secret — the only thing the UI may see. */
 export type SecretHandle = {
   digest: string;
   short: string;
 };
+
+/** Wallet connection info surfaced to the UI. The live ConnectedAPI object is
+ *  kept in a separate module-level variable — never in state, never persisted. */
+export type ConnectedWallet = {
+  name: string;
+  address: string;
+  addressShort: string;
+  networkId: string;
+  networkOk: boolean;
+};
+
+/** `null` = still on the landing page. `'demo'` = simulated mode, no wallet. */
+export type WalletMode = ConnectedWallet | 'demo';
 
 export interface IssuedCredential {
   handle: SecretHandle;
@@ -53,6 +68,7 @@ export interface SessionState {
   userSecretId: string;
   userCredential: IssuedCredential | undefined;
   eventLog: string[];
+  wallet: WalletMode | null;
 }
 
 let state: SessionState = {
@@ -63,6 +79,7 @@ let state: SessionState = {
   userSecretId: 'user',
   userCredential: undefined,
   eventLog: [],
+  wallet: null,
 };
 
 // --- tiny reactive core -----------------------------------------------------
@@ -126,6 +143,43 @@ export function logEvent(msg: string): void {
   mutate((s) => {
     s.eventLog = [...s.eventLog, msg].slice(-20);
   });
+}
+
+// --- wallet connection (in-memory only — nothing is persisted) ---------------
+
+/** The live ConnectedAPI from the DApp Connector. Kept outside SessionState so
+ *  it never enters render state, JSON, or any storage. */
+let liveApi: ConnectedAPI | null = null;
+
+export function getConnectedApi(): ConnectedAPI | null {
+  return liveApi;
+}
+
+export function setConnectedApi(api: ConnectedAPI | null): void {
+  liveApi = api;
+}
+
+export function setWallet(wallet: WalletMode | null): void {
+  mutate((s) => {
+    s.wallet = wallet;
+  });
+}
+
+export function setDemoMode(): void {
+  mutate((s) => {
+    s.wallet = 'demo';
+  });
+}
+
+/** Drop the connection and return to the landing page. */
+export async function disconnectWallet(): Promise<void> {
+  try {
+    await liveApi?.disconnect?.();
+  } catch {
+    /* the wallet may be gone — ignore */
+  }
+  liveApi = null;
+  setWallet(null);
 }
 
 export { random32 };

@@ -9,48 +9,76 @@
 #   docker compose up -d          # start the stack
 #   docker compose down           # stop it
 #
-# NOTE: image tags track the official Midnight "devnet" images. If the tag is
-# out of date for the installed `compact` toolchain, adjust it to the version
-# used by your current `create-mn-app` setup. Configuration is minimal so the
-# services boot and talk to each other on the overlay network; the wallet CLI
-# (src/*.ts) targets these host ports via .env.
+# Images and health checks track the official midnight-local-dev reference
+# (github.com/midnightntwrk/midnight-local-dev). The indexer is the
+# `indexer-standalone` image; the whole stack runs the network id `undeployed`
+# with the `dev` node preset. Keep versions in step with the installed
+# `compact` toolchain / `@midnight-ntwrk/*` packages.
 
 services:
   midnight-node:
-    image: midnightnetwork/midnight-node:latest
+    image: midnightntwrk/midnight-node:1.0.0
+    container_name: midnight-node
     platform: linux/amd64
     ports:
-      - "9944:9944"
+      - "127.0.0.1:9944:9944"
     environment:
-      MIDNIGHT_RPC_PORT: 9944
-      MIDNIGHT_CONNECT_TO_GRPCPROXY: "false"
+      CFG_PRESET: "dev"
+      SIDECHAIN_BLOCK_BENEFICIARY: "04bcf7ad3be7a5c790460be82a713af570f22e0f801f6659ab8e84a52be6969e"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9944/health"]
-      interval: 10s
+      # Gate on block #1 existing, not merely on the RPC port answering. The
+      # indexer's spo-indexer resolves block #1 immediately on startup and
+      # exits non-zero ("block number 1 not found") if the node is still at
+      # genesis. /health answers before block #1 exists, so it alone would
+      # release the indexer too early.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -X POST -H \"Content-Type: application/json\" -d \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"method\\\":\\\"chain_getBlockHash\\\",\\\"params\\\":[1]}\" http://localhost:9944 | grep -q \"\\\"result\\\":\\\"0x\"",
+        ]
+      interval: 2s
       timeout: 5s
       retries: 30
+      start_period: 20s
 
   midnight-indexer:
-    image: midnightnetwork/midnight-indexer:latest
+    image: midnightntwrk/indexer-standalone:4.3.3
+    container_name: midnight-indexer
     platform: linux/amd64
     ports:
-      - "8088:8088"
+      - "127.0.0.1:8088:8088"
     depends_on:
       midnight-node:
         condition: service_healthy
     environment:
-      MIDNIGHT_NODE_URL: http://midnight-node:9944
-      MIDNIGHT_LISTEN_ADDR: 0.0.0.0:8088
+      RUST_LOG: "indexer=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,fastrace_opentelemetry=off,info"
+      APP__INFRA__NODE__URL: "ws://midnight-node:9944"
+      APP__APPLICATION__NETWORK_ID: "undeployed"
+      APP__INFRA__STORAGE__PASSWORD: "indexer"
+      APP__INFRA__PUB_SUB__PASSWORD: "indexer"
+      APP__INFRA__LEDGER_STATE_STORAGE__PASSWORD: "indexer"
+      APP__INFRA__SECRET: "303132333435363738393031323334353637383930313233343536373839303132"
+      APP__INFRA__SPO_NODE__URL: "ws://midnight-node:9944"
+      APP__INFRA__SPO_NODE__BLOCKFROST_ID: "e2e-test-dummy-id"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      test: ["CMD-SHELL", "cat /var/run/indexer-standalone/running"]
       interval: 10s
       timeout: 5s
-      retries: 30
+      retries: 20
+      start_period: 10s
 
   midnight-proof-server:
-    image: midnightnetwork/midnight-proof-server:latest
+    image: midnightntwrk/proof-server:8.1.0
+    container_name: midnight-proof-server
     platform: linux/amd64
+    command: ["midnight-proof-server", "-v"]
     ports:
-      - "6300:6300"
+      - "127.0.0.1:6300:6300"
     environment:
-      MIDNIGHT_PROOF_SERVER_LISTEN_ADDR: 0.0.0.0:6300
+      RUST_BACKTRACE: "full"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/6300"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

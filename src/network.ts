@@ -86,22 +86,30 @@ export async function checkNodeHealth(cfg: NetworkConfig): Promise<boolean> {
 }
 
 export async function checkIndexerHealth(cfg: NetworkConfig): Promise<boolean> {
-  // Indexer health surfaces vary across Midnight releases; try the two common
-  // ones so a healthy but differently-instrumented indexer isn't reported down.
+  // Indexer health surfaces vary across Midnight releases; try the common ones
+  // so a healthy but differently-instrumented indexer isn't reported down:
+  // - /health (older standalone images)
+  // - /graphql  (pre-v4 indexer base path)
+  // - /api/v4/graphql (indexer-standalone 4.x, used by the local devnet)
   if (await probe(cfg.indexerUrl, '/health')) {
     return true;
   }
-  try {
-    const res = await fetch(`${cfg.indexerUrl}/graphql`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ query: '{ chainTip { height } }' }),
-      signal: AbortSignal.timeout(3000),
-    });
-    return res.status === 200;
-  } catch {
-    return false;
+  for (const path of ['/graphql', '/api/v4/graphql']) {
+    try {
+      const res = await fetch(`${cfg.indexerUrl}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ query: '{ chainTip { height } }' }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.status === 200) {
+        return true;
+      }
+    } catch {
+      /* try the next probe */
+    }
   }
+  return false;
 }
 
 /** Human-readable readiness report used by the CLI. */
